@@ -1,0 +1,14 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jolt
+        run: curl -sL https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash
+      - name: Test
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          jolt run test/jolt/pty_test.clj
+          jolt run test/jolt/pty_relay_test.clj
