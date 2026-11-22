@@ -161,3 +161,93 @@
   (close! (:primary-fd pty))
   (close! (:secondary-fd pty))
   nil)
+
+;; -- window size + relay -----------------------------------------------------
+;; The console-relay half of dirge's pty_relay.rs: apply the host terminal size
+;; to the pty, then copy bytes between the pty primary and host stdio until the
+;; child exits. (The RFC 4254 ECHO handshake in dirge's relay exists because
+;; its TUI owns /dev/tty in raw mode; a plain library consumer whose stdio is a
+;; normal terminal does not need it, so it is deliberately not ported here.)
+(ffi/defcfn c-ioctl "ioctl" [:int :ulong :pointer] :int)
+
+(def ^:const TIOCGWINSZ 0x5413)  ; Linux x86_64/aarch64
+(def ^:const TIOCSWINSZ 0x5414)
+
+(defn get-winsize
+  "Read a tty's window size via TIOCGWINSZ. Returns {:rows :cols}, or nil if
+  fd is not a tty."
+  [fd]
+  (let [p (ffi/alloc 8)]
+    (try
+      (if (zero? (c-ioctl fd TIOCGWINSZ p))
+        {:rows (ffi/read p :ushort 0) :cols (ffi/read p :ushort 2)}
+        nil)
+      (finally (ffi/free p)))))
+
+(defn set-winsize!
+  "Set a tty's window size via TIOCSWINSZ. Returns the ioctl rc (0 on success)."
+  [fd rows cols]
+  (let [p (ffi/alloc 8)]
+    (try
+      (ffi/write p :ushort rows 0)
+      (ffi/write p :ushort cols 2)
+      (c-ioctl fd TIOCSWINSZ p)
+      (finally (ffi/free p)))))
+
+(defn- apply-host-winsize!
+  "Copy the host terminal's size (from stdin, fd 0) onto the pty primary,
+  falling back to 80x24 when stdin is not a tty."
+  [primary-fd]
+  (let [{:keys [rows cols]} (or (get-winsize 0) {:rows 24 :cols 80})]
+    (set-winsize! primary-fd rows cols)))
+
+(defn spawn-secondary!
+  "Spawn argv with stdin/stdout/stderr attached to the pty secondary, as a
+  session leader (setsid) so the secondary becomes its controlling terminal.
+  Returns the Process. Pair with relay!."
+  [pty argv]
+  (let [name (:secondary-name pty)
+        wrapper (str "exec \"$@\" 0<" name " 1>" name " 2>&1")
+        args (concat ["setsid" "sh" "-c" wrapper "sh"] (map str argv))
+        pb (ProcessBuilder. (into-array String args))]
+    (.start pb)))
+
+(defn- relay-read-loop! [fd out]
+  (try
+    (loop []
+      (let [b (read-fd fd 4096)]
+        (if (zero? (alength b))
+          :eof
+          (do (.write out b) (.flush out) (recur)))))
+    (catch Throwable _ :eof)))
+
+(defn relay!
+  "Relay bytes between the pty primary and host stdio until child exits.
+  Applies the host terminal size first. Returns the child's exit status.
+  child must have been spawned by spawn-secondary!."
+  [pty child]
+  (let [master (:primary-fd pty)
+        done (atom false)
+        m2s (future (relay-read-loop! master System/out))
+        s2m (future
+              (loop []
+                (when-not @done
+                  (let [avail (.available System/in)]
+                    (if (pos? avail)
+                      (let [buf (byte-array (min avail 4096))
+                            n (.read System/in buf)]
+                        (when (pos? n)
+                          (let [chunk (if (= n (alength buf))
+                                        buf
+                                        (let [c (byte-array n)]
+                                          (System/arraycopy buf 0 c 0 n)
+                                          c))]
+                            (write-fd master chunk))))
+                      (Thread/sleep 50))
+                    (recur)))))
+        code (.waitFor child)]
+    (reset! done true)
+    (close! master)                       ; unblock the primary reader
+    (try (deref m2s 2000 nil) (catch Throwable _ nil))
+    (try (deref s2m 2000 nil) (catch Throwable _ nil))
+    code))
